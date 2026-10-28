@@ -5,132 +5,180 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
+use std::str::FromStr;
 use uuid::Uuid;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, sqlx::FromRow)]
 struct Person {
-    id: Uuid,
+    id: String,
     name: String,
     card_number: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, sqlx::FromRow)]
 struct Purchase {
-    id: Uuid,
+    id: String,
     description: String,
     total_amount: i64,
-    paid_by: Uuid,
-    created_at: DateTime<Utc>,
+    paid_by: String,
+    created_at: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, sqlx::FromRow)]
 struct Share {
-    id: Uuid,
-    purchase_id: Uuid,
-    person_id: Uuid,
+    id: String,
+    purchase_id: String,
+    person_id: String,
     amount: i64,
-    is_paid: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct Database {
-    persons: Vec<Person>,
-    purchases: Vec<Purchase>,
-    shares: Vec<Share>,
-}
-type Db = Arc<Mutex<Database>>;
-
-impl Person {
-    fn new(name: String, card_number: String) -> Self {
-        Person {
-            id: Uuid::new_v4(),
-            name,
-            card_number,
-        }
-    }
-}
-
-impl Purchase {
-    fn new(description: String, total_amount: i64, paid_by: Uuid) -> Self {
-        Purchase {
-            id: Uuid::new_v4(),
-            description,
-            total_amount,
-            paid_by,
-            created_at: Utc::now(),
-        }
-    }
-}
-
-impl Share {
-    fn new(purchase_id: Uuid, person_id: Uuid, amount: i64, is_paid: bool) -> Self {
-        Share {
-            id: Uuid::new_v4(),
-            purchase_id,
-            person_id,
-            amount,
-            is_paid,
-        }
-    }
+    is_paid: i64,
 }
 
 #[tokio::main]
-async fn main() {
-    let db = Arc::new(Mutex::new(Database {
-        persons: Vec::new(),
-        purchases: Vec::new(),
-        shares: Vec::new(),
-    }));
+async fn main() -> anyhow::Result<()> {
+    let options = SqliteConnectOptions::from_str("sqlite://data.db")?.create_if_missing(true);
+    let pool = SqlitePool::connect_with(options).await?;
+
+    init_db(&pool).await?;
 
     let app = Router::new()
         .route("/", get(get_database))
         .route("/persons", get(list_persons).post(add_person))
         .route("/purchases", get(list_purchases).post(add_purchase))
         .route("/shares/{id}/pay", post(pay_share))
-        .with_state(db);
+        .with_state(pool);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+    println!("listening on {}", listener.local_addr()?);
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+async fn init_db(pool: &SqlitePool) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS persons (
+            id          TEXT PRIMARY KEY NOT NULL,
+            name        TEXT NOT NULL,
+            card_number TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS purchases (
+            id           TEXT PRIMARY KEY NOT NULL,
+            description  TEXT NOT NULL,
+            total_amount INTEGER NOT NULL,
+            paid_by      TEXT NOT NULL,
+            created_at   TEXT NOT NULL,
+            FOREIGN KEY (paid_by) REFERENCES persons(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS shares (
+            id          TEXT PRIMARY KEY NOT NULL,
+            purchase_id TEXT NOT NULL,
+            person_id   TEXT NOT NULL,
+            amount      INTEGER NOT NULL,
+            is_paid     INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (purchase_id) REFERENCES purchases(id),
+            FOREIGN KEY (person_id)   REFERENCES persons(id)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn get_database(State(pool): State<SqlitePool>) -> impl IntoResponse {
+    let persons = sqlx::query_as::<_, Person>("SELECT * FROM persons")
+        .fetch_all(&pool)
         .await
-        .unwrap();
+        .unwrap_or_default();
 
-    println!("listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
+    let purchases = sqlx::query_as::<_, Purchase>("SELECT * FROM purchases")
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+
+    let shares = sqlx::query_as::<_, Share>("SELECT * FROM shares")
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+
+    let db = serde_json::json!({
+        "persons": persons,
+        "purchases": purchases,
+        "shares": shares,
+    });
+
+    (StatusCode::OK, Json(db))
 }
 
-async fn get_database(State(db): State<Db>) -> impl IntoResponse {
-    let database = db.lock().unwrap().clone();
-    (StatusCode::OK, Json(database))
+async fn list_persons(State(pool): State<SqlitePool>) -> impl IntoResponse {
+    match sqlx::query_as::<_, Person>("SELECT * FROM persons")
+        .fetch_all(&pool)
+        .await
+    {
+        Ok(persons) => (StatusCode::OK, Json(persons)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
-async fn list_persons(State(db): State<Db>) -> impl IntoResponse {
-    let persons = db.lock().unwrap().persons.clone();
-    (StatusCode::OK, Json(persons))
-}
-
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize)]
 struct NewPerson {
     name: String,
     card_number: String,
 }
 
-async fn add_person(State(db): State<Db>, Json(person): Json<NewPerson>) -> impl IntoResponse {
-    let mut database = db.lock().unwrap();
+async fn add_person(
+    State(pool): State<SqlitePool>,
+    Json(payload): Json<NewPerson>,
+) -> impl IntoResponse {
+    let id = Uuid::new_v4().to_string();
 
-    database
-        .persons
-        .push(Person::new(person.name, person.card_number));
+    let result = sqlx::query("INSERT INTO persons (id, name, card_number) VALUES (?, ?, ?)")
+        .bind(&id)
+        .bind(&payload.name)
+        .bind(&payload.card_number)
+        .execute(&pool)
+        .await;
 
-    (StatusCode::CREATED, Json(database.persons.clone()))
+    match result {
+        Ok(_) => {
+            let person = Person {
+                id,
+                name: payload.name,
+                card_number: payload.card_number,
+            };
+            (StatusCode::CREATED, Json(person)).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
-async fn list_purchases(State(db): State<Db>) -> impl IntoResponse {
-    let purchases = db.lock().unwrap().purchases.clone();
-
-    (StatusCode::OK, Json(purchases))
+async fn list_purchases(State(pool): State<SqlitePool>) -> impl IntoResponse {
+    match sqlx::query_as::<_, Purchase>("SELECT * FROM purchases")
+        .fetch_all(&pool)
+        .await
+    {
+        Ok(purchases) => (StatusCode::OK, Json(purchases)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,13 +190,10 @@ struct NewPurchase {
 }
 
 async fn add_purchase(
-    State(db): State<Db>,
-    Json(new_purchase): Json<NewPurchase>,
+    State(pool): State<SqlitePool>,
+    Json(payload): Json<NewPurchase>,
 ) -> impl IntoResponse {
-    let mut database = db.lock().unwrap();
-
-    // Check 1: split_between must not be empty
-    if new_purchase.split_between.is_empty() {
+    if payload.split_between.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "split_between cannot be empty" })),
@@ -156,12 +201,14 @@ async fn add_purchase(
             .into_response();
     }
 
-    // Check 2: paid_by must exist
-    if !database
-        .persons
-        .iter()
-        .any(|p| p.id == new_purchase.paid_by)
-    {
+    let paid_by_str = payload.paid_by.to_string();
+    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM persons WHERE id = ?")
+        .bind(&paid_by_str)
+        .fetch_optional(&pool)
+        .await
+        .unwrap_or(None);
+
+    if exists.is_none() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "paid_by person does not exist" })),
@@ -169,34 +216,91 @@ async fn add_purchase(
             .into_response();
     }
 
-    let purchase = Purchase::new(
-        new_purchase.description,
-        new_purchase.total_amount,
-        new_purchase.paid_by,
-    );
+    let purchase_id = Uuid::new_v4().to_string();
+    let created_at = Utc::now().to_rfc3339();
+    let amount = payload.total_amount / payload.split_between.len() as i64;
 
-    let amount = new_purchase.total_amount / new_purchase.split_between.len() as i64;
-
-    for person_id in new_purchase.split_between {
-        if database.persons.iter().any(|p| p.id == person_id) {
-            let is_paid = person_id == purchase.paid_by;
-            let new_share = Share::new(purchase.id, person_id, amount, is_paid);
-            database.shares.push(new_share);
-        }
+    if let Err(e) = sqlx::query(
+        "INSERT INTO purchases (id, description, total_amount, paid_by, created_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&purchase_id)
+    .bind(&payload.description)
+    .bind(payload.total_amount)
+    .bind(&paid_by_str)
+    .bind(&created_at)
+    .execute(&pool)
+    .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response();
     }
 
-    database.purchases.push(purchase);
+    for person_id in &payload.split_between {
+        let person_id_str = person_id.to_string();
 
-    (StatusCode::CREATED, Json(database.purchases.clone())).into_response()
+        let person_exists: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM persons WHERE id = ?")
+                .bind(&person_id_str)
+                .fetch_optional(&pool)
+                .await
+                .unwrap_or(None);
+
+        if person_exists.is_none() {
+            continue;
+        }
+
+        let share_id = Uuid::new_v4().to_string();
+        let is_paid: i64 = if *person_id == payload.paid_by { 1 } else { 0 };
+
+        let _ = sqlx::query(
+            "INSERT INTO shares (id, purchase_id, person_id, amount, is_paid) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&share_id)
+        .bind(&purchase_id)
+        .bind(&person_id_str)
+        .bind(amount)
+        .bind(is_paid)
+        .execute(&pool)
+        .await;
+    }
+
+    let purchase = Purchase {
+        id: purchase_id,
+        description: payload.description,
+        total_amount: payload.total_amount,
+        paid_by: paid_by_str,
+        created_at,
+    };
+
+    (StatusCode::CREATED, Json(purchase)).into_response()
 }
 
-async fn pay_share(State(db): State<Db>, Path(id): Path<Uuid>) -> impl IntoResponse {
-    let mut database = db.lock().unwrap();
+async fn pay_share(State(pool): State<SqlitePool>, Path(id): Path<Uuid>) -> impl IntoResponse {
+    let id_str = id.to_string();
 
-    if let Some(share) = database.shares.iter_mut().find(|s| s.id == id) {
-        share.is_paid = true;
-        return (StatusCode::OK, Json(database.shares.clone()));
+    let result = sqlx::query("UPDATE shares SET is_paid = 1 WHERE id = ?")
+        .bind(&id_str)
+        .execute(&pool)
+        .await;
+
+    match result {
+        Ok(res) if res.rows_affected() > 0 => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "paid" })),
+        )
+            .into_response(),
+        Ok(_) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "share not found" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
     }
-
-    (StatusCode::NOT_FOUND, Json(Vec::<Share>::new()))
 }
